@@ -138,7 +138,8 @@ EOL
         # Create the directory if it doesn't exist
         mkdir -p "$(dirname "$CONFIG_FILE")"
         
-        # Create the default configuration file
+        # Create the default configuration file (private: it will hold the API key)
+        ( umask 077; : > "$CONFIG_FILE" )
         cat > "$CONFIG_FILE" << EOL
 # Monitor Configuration Default
 EMAIL_FROM="onboarding@resend.dev"

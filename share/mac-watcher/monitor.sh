@@ -1,11 +1,16 @@
 #!/bin/bash
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
+# Photos, screenshots, location, logs and mail payloads are private to the user
+umask 077
+
 #############################
 # Configuration and Directory Setup
 #############################
 CONFIG_FILE="$HOME/.config/monitor.conf"
 if [ -f "$CONFIG_FILE" ]; then
+    # Existing installs created the file world-readable; it holds the API key
+    [ -O "$CONFIG_FILE" ] && chmod 600 "$CONFIG_FILE" 2>/dev/null
     source "$CONFIG_FILE"
     echo "Using configuration from $CONFIG_FILE"
 else
@@ -77,6 +82,9 @@ SECOND_NUM=${SECOND#0}
 
 # Fixed printf command - explicitly converting arguments to numbers
 TIME=$(printf "(%s)-%02d.%02d.%02d" "$AMPM" "$HOUR" $MINUTE_NUM $SECOND_NUM)
+
+: "${BASE_DIR:?BASE_DIR is not set in $CONFIG_FILE}"
+: ${DEBUG_EMAIL_JSON:="no"}
 
 TARGET_DIR="$BASE_DIR/$YEAR/$MONTH/$DAY_WITH_DATE/$TIME"
 mkdir -p "$TARGET_DIR"
@@ -191,9 +199,16 @@ generate_html_initial_email() {
         shot_status="Disabled"
     fi
     
-    # Create map link
-    local map_link="https://maps.apple.com/?q=${latitude},${longitude}&ll=${latitude},${longitude}"
     
+    # Values come from the network (SSID, IP, reverse geocoding): escape before
+    # putting them into HTML, and keep only numeric coordinates for the map link
+    latitude=$(sanitize_coordinate "$latitude")
+    longitude=$(sanitize_coordinate "$longitude")
+    local _v
+    for _v in username locality sublocality admin_area postal_code country local_time timezone wifi_ssid local_ip public_ip photo_status shot_status; do
+        [ -n "${!_v+x}" ] && printf -v "$_v" '%s' "$(html_escape "${!_v}")"
+    done
+    local map_link="https://maps.apple.com/?q=${latitude},${longitude}&amp;ll=${latitude},${longitude}"
     # Generate HTML email template
     cat <<EOF
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
@@ -508,9 +523,16 @@ generate_html_followup_email() {
         shot_status="Disabled"
     fi
     
-    # Create map link
-    local map_link="https://maps.apple.com/?q=${latitude},${longitude}&ll=${latitude},${longitude}"
     
+    # Values come from the network (SSID, IP, reverse geocoding): escape before
+    # putting them into HTML, and keep only numeric coordinates for the map link
+    latitude=$(sanitize_coordinate "$latitude")
+    longitude=$(sanitize_coordinate "$longitude")
+    local _v
+    for _v in username locality sublocality admin_area postal_code country local_time timezone wifi_ssid local_ip public_ip photo_status shot_status; do
+        [ -n "${!_v+x}" ] && printf -v "$_v" '%s' "$(html_escape "${!_v}")"
+    done
+    local map_link="https://maps.apple.com/?q=${latitude},${longitude}&amp;ll=${latitude},${longitude}"
     # Generate HTML email template
     cat <<EOF
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
@@ -861,6 +883,81 @@ save_json_debug() {
 }
 
 #############################
+# Helper Function: HTML Escape
+#############################
+html_escape() {
+    local s="$1"
+    s="${s//&/&amp;}"
+    s="${s//</&lt;}"
+    s="${s//>/&gt;}"
+    s="${s//\"/&quot;}"
+    s="${s//\'/&#39;}"
+    printf '%s' "$s"
+}
+
+# Keep a coordinate only if it is a plain decimal number
+sanitize_coordinate() {
+    if [[ "$1" =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]]; then
+        printf '%s' "$1"
+    else
+        printf 'Not available'
+    fi
+}
+
+#############################
+# Helper Function: Build Resend email payload
+# Usage: build_email_payload OUT_FILE SUBJECT html|text BODY [FILENAME=PATH ...]
+# All fields are encoded by jq, so no value can break out of its JSON string.
+# Attachments whose file is missing or empty are skipped.
+#############################
+build_email_payload() {
+    local out="$1" subject="$2" kind="$3" body="$4"
+    shift 4
+
+    jq -n \
+        --arg from "Mac Watcher <${EMAIL_FROM}>" \
+        --arg to "$EMAIL_TO" \
+        --arg subject "$subject" \
+        --arg kind "$kind" \
+        --arg body "$body" \
+        '{from: $from, to: $to, subject: $subject, reply_to: $from} + {($kind): $body}' > "$out" || return 1
+
+    local spec name file b64
+    for spec in "$@"; do
+        name="${spec%%=*}"
+        file="${spec#*=}"
+        [ -f "$file" ] && [ -s "$file" ] || continue
+        b64="$out.b64"
+        base64 < "$file" | tr -d '\n' > "$b64"
+        jq --arg filename "$name" --rawfile content "$b64" \
+            '.attachments += [{filename: $filename, content: $content}]' "$out" > "$out.tmp" &&
+            mv "$out.tmp" "$out"
+        rm -f "$b64"
+    done
+
+    if [ "$DEBUG_EMAIL_JSON" = "yes" ]; then
+        local tag=initial
+        [[ "$out" == *followup* ]] && tag=followup
+        save_json_debug "$out" "$TARGET_DIR/debug_${tag}_email.json"
+    fi
+}
+
+#############################
+# Helper Function: Send payload to Resend
+# Prints the response body followed by the 3-digit HTTP status.
+# The API key is passed to curl on stdin, so it never appears in the process list.
+#############################
+send_email_payload() {
+    local payload="$1"
+    printf 'header = "Authorization: Bearer %s"\n' "$RESEND_API_KEY" |
+        curl -s -w "%{http_code}" -X POST \
+            --config - \
+            -H "Content-Type: application/json" \
+            --data-binary "@$payload" \
+            "https://api.resend.com/emails"
+}
+
+#############################
 # Helper Function: Collect Network Information
 #############################
 collect_network_info() {
@@ -914,8 +1011,8 @@ collect_network_info() {
     if check_internet; then
         echo "Internet connection available, getting public IP..." >&2
         if command -v curl >/dev/null 2>&1; then
-            local public_ip_output=$(curl -s ipinfo.io/ip 2>/dev/null)
-            if [ -n "$public_ip_output" ]; then
+            local public_ip_output=$(curl -s --max-time 10 https://ipinfo.io/ip 2>/dev/null)
+            if [[ "$public_ip_output" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$public_ip_output" =~ ^[0-9a-fA-F:]{2,39}$ ]]; then
                 public_ip="$public_ip_output"
                 echo "Found public IP: $public_ip" >&2
             else
@@ -945,9 +1042,38 @@ EOF
 #############################
 run_auto_delete() {
     if [ "$AUTO_DELETE_ENABLED" = "yes" ] && [ "$AUTO_DELETE_DAYS" -gt 0 ]; then
-        echo "Checking for files older than $AUTO_DELETE_DAYS days to delete..."
-        find "$BASE_DIR" -type f -mtime +$AUTO_DELETE_DAYS -exec rm -f {} \; 2>/dev/null
-        find "$BASE_DIR" -type d -empty -delete 2>/dev/null
+        case "$BASE_DIR" in
+            /?*) ;;
+            *)
+                echo "Auto-delete skipped: BASE_DIR '$BASE_DIR' must be an absolute path."
+                return
+                ;;
+        esac
+        local base
+        base=$(cd "$BASE_DIR" 2>/dev/null && pwd -P) || {
+            echo "Auto-delete skipped: BASE_DIR '$BASE_DIR' is not an existing directory."
+            return
+        }
+        local home_real
+        home_real=$(cd "$HOME" && pwd -P)
+        # Never run on /, $HOME itself or anything outside $HOME
+        case "$base" in
+            "$home_real"/?*) ;;
+            *)
+                echo "Auto-delete skipped: BASE_DIR '$base' must be a directory inside $home_real."
+                return
+                ;;
+        esac
+
+        echo "Checking for files older than $AUTO_DELETE_DAYS days to delete in $base..."
+        # Only the YEAR/... tree mac-watcher creates, never other content of BASE_DIR
+        local year_dir
+        for year_dir in "$base"/[0-9][0-9][0-9][0-9]; do
+            [ -d "$year_dir" ] || continue
+            find "$year_dir" -type f -mtime +"$AUTO_DELETE_DAYS" -delete 2>/dev/null
+            find "$year_dir" -mindepth 1 -type d -empty -delete 2>/dev/null
+            rmdir "$year_dir" 2>/dev/null
+        done
         echo "Auto-delete process completed."
     fi
 }
@@ -1443,15 +1569,7 @@ send_initial_email_from_queue() {
         # Generate HTML email content
         local email_html=$(generate_html_initial_email "$CURRENT_USER" "$photo_local" "$shot_local")
         
-        # Create JSON with HTML content
-        cat > "$temp_json" << EOF
-{
-  "from": "Mac Watcher <${EMAIL_FROM}>",
-  "to": "${EMAIL_TO}",
-  "subject": "${email_subject}",
-  "reply_to": "${EMAIL_FROM}",
-  "html": $(printf '%s' "$email_html" | jq -Rs .)
-EOF
+        local body_kind="html" body_content="$email_html"
     else
         # Get location information for plain text email
         local location_info="Location tracking Disabled"
@@ -1509,64 +1627,20 @@ Local IP Address: Disabled
 Public IP Address: Disabled"
         fi
         
-        # Create email JSON with proper escaping
-        local escaped_body=$(echo "$email_body" | sed 's/"/\\"/g' | sed 's/$/\\n/g' | tr -d '\n')
-        
-        # Setup JSON with plain text content
-        cat > "$temp_json" << EOF
-{
-  "from": "Mac Watcher <${EMAIL_FROM}>",
-  "to": "${EMAIL_TO}",
-  "subject": "${email_subject}",
-  "reply_to": "${EMAIL_FROM}",
-  "text": "${escaped_body}"
-EOF
+        local body_kind="text" body_content="$email_body"
     fi
 
-    # Add attachments only if available (same for both HTML and plain text)
-    if ([ "$WEBCAM_ENABLED" = "yes" ] && [ -f "$photo" ] && [ -s "$photo" ]) || ([ "$SCREENSHOT_ENABLED" = "yes" ] && [ -f "$screenshot" ] && [ -s "$screenshot" ]); then
-        echo "," >> "$temp_json"
-        echo "  \"attachments\": [" >> "$temp_json"
-        
-        local attachment_count=0
-        
-        if [ "$WEBCAM_ENABLED" = "yes" ] && [ -f "$photo" ] && [ -s "$photo" ]; then
-            local photo_data
-            photo_data=$(base64 < "$photo" | tr -d '\n')
-            echo "    {" >> "$temp_json"
-            echo "      \"filename\": \"webcam.jpg\"," >> "$temp_json"
-            echo "      \"content\": \"${photo_data}\"" >> "$temp_json"
-            echo "    }" >> "$temp_json"
-            attachment_count=$((attachment_count + 1))
-        fi
-        
-        if [ "$SCREENSHOT_ENABLED" = "yes" ] && [ -f "$screenshot" ] && [ -s "$screenshot" ]; then
-            if [ $attachment_count -gt 0 ]; then
-                echo "    ," >> "$temp_json"
-            fi
-            local screenshot_data
-            screenshot_data=$(base64 < "$screenshot" | tr -d '\n')
-            echo "    {" >> "$temp_json"
-            echo "      \"filename\": \"screen.jpg\"," >> "$temp_json"
-            echo "      \"content\": \"${screenshot_data}\"" >> "$temp_json"
-            echo "    }" >> "$temp_json"
-        fi
-        
-        echo "  ]" >> "$temp_json"
-    fi
-    
-    echo "}" >> "$temp_json"
-    
-    # Save JSON for debugging
-    save_json_debug "$temp_json" "$TARGET_DIR/debug_initial_email.json"
+    build_email_payload "$temp_json" "${email_subject}" "$body_kind" "$body_content" \
+        "webcam.jpg=$([ "$WEBCAM_ENABLED" = "yes" ] && echo "$photo")" \
+        "screen.jpg=$([ "$SCREENSHOT_ENABLED" = "yes" ] && echo "$screenshot")" || {
+        echo "Failed to build initial email payload"
+        rm -f "$temp_json"
+        return 1
+    }
 
-    echo "Sending initial email to ${EMAIL_TO} from ${EMAIL_FROM}..."
+    echo "Sending initial email"
     local response
-    response=$(curl -s -w "%{http_code}" -X POST \
-       -H "Authorization: Bearer ${RESEND_API_KEY}" \
-       -H "Content-Type: application/json" \
-       --data-binary "@$temp_json" \
-       "https://api.resend.com/emails")
+    response=$(send_email_payload "$temp_json")
     rm -f "$temp_json"
 
     local http_code=${response: -3}
@@ -1646,15 +1720,7 @@ send_followup_email_from_queue() {
         # Generate HTML email content
         local email_html=$(generate_html_followup_email "$CURRENT_USER" "$shot_local")
         
-        # Create JSON with HTML content
-        cat > "$temp_json" << EOF
-{
-  "from": "Mac Watcher <${EMAIL_FROM}>",
-  "to": "${EMAIL_TO}",
-  "subject": "Re: ${original_subject}",
-  "reply_to": "${EMAIL_FROM}",
-  "html": $(printf '%s' "$email_html" | jq -Rs .)
-EOF
+        local body_kind="html" body_content="$email_html"
     else
         # Get location information for plain text
         local location_info="Location tracking Disabled"
@@ -1700,48 +1766,19 @@ Local IP Address: Disabled
 Public IP Address: Disabled"
         fi
         
-        # Create email JSON with proper escaping
-        local escaped_body=$(echo "$email_body" | sed 's/"/\\"/g' | sed 's/$/\\n/g' | tr -d '\n')
-        
-        # Create the base JSON structure
-        cat > "$temp_json" << EOF
-{
-  "from": "Mac Watcher <${EMAIL_FROM}>",
-  "to": "${EMAIL_TO}",
-  "subject": "Re: ${original_subject}",
-  "reply_to": "${EMAIL_FROM}",
-  "text": "${escaped_body}"
-EOF
+        local body_kind="text" body_content="$email_body"
     fi
     
-    # Only add screenshot if available and enabled in config
-    if [ "$SCREENSHOT_ENABLED" = "yes" ] && [ -f "$screenshot" ] && [ -s "$screenshot" ]; then
-        local screenshot_data
-        screenshot_data=$(base64 < "$screenshot" | tr -d '\n')
-        echo "," >> "$temp_json"
-        cat >> "$temp_json" << EOF
-  "attachments": [
-    {
-      "filename": "follow_up_screen.jpg",
-      "content": "${screenshot_data}"
+    build_email_payload "$temp_json" "Re: ${original_subject}" "$body_kind" "$body_content" \
+        "follow_up_screen.jpg=$([ "$SCREENSHOT_ENABLED" = "yes" ] && echo "$screenshot")" || {
+        echo "Failed to build follow-up email payload"
+        rm -f "$temp_json"
+        return 1
     }
-  ]
-EOF
-    fi
-    
-    # Close the JSON object
-    echo "}" >> "$temp_json"
-    
-    # Save JSON for debugging
-    save_json_debug "$temp_json" "$TARGET_DIR/debug_followup_email.json"
 
     echo "Sending follow-up email"
     local response
-    response=$(curl -s -w "%{http_code}" -X POST \
-      -H "Authorization: Bearer ${RESEND_API_KEY}" \
-      -H "Content-Type: application/json" \
-      --data-binary "@$temp_json" \
-      "https://api.resend.com/emails")
+    response=$(send_email_payload "$temp_json")
     rm -f "$temp_json"
 
     local http_code=${response: -3}
@@ -2005,15 +2042,7 @@ send_initial_email() {
         # Generate HTML email content
         local email_html=$(generate_html_initial_email "$CURRENT_USER" "$PHOTO_LOCAL_CAPTURE" "$SCREENSHOT_LOCAL_CAPTURE")
         
-        # Create JSON with HTML content
-        cat > "$temp_json" << EOF
-{
-  "from": "Mac Watcher <${EMAIL_FROM}>",
-  "to": "${EMAIL_TO}",
-  "subject": "${email_subject}",
-  "reply_to": "${EMAIL_FROM}",
-  "html": $(printf '%s' "$email_html" | jq -Rs .)
-EOF
+        local body_kind="html" body_content="$email_html"
     else
         # Get location information for plain text
         local location_info="Location tracking Disabled"
@@ -2077,64 +2106,20 @@ Local IP Address: Disabled
 Public IP Address: Disabled"
         fi
 
-        # Create email JSON with proper escaping
-        local escaped_body=$(echo "$email_body" | sed 's/"/\\"/g' | sed 's/$/\\n/g' | tr -d '\n')
-        
-        # Setup JSON with plain text content
-        cat > "$temp_json" << EOF
-{
-  "from": "Mac Watcher <${EMAIL_FROM}>",
-  "to": "${EMAIL_TO}",
-  "subject": "${email_subject}",
-  "reply_to": "${EMAIL_FROM}",
-  "text": "${escaped_body}"
-EOF
+        local body_kind="text" body_content="$email_body"
     fi
 
-    # Add attachments only if available (same for both HTML and plain text)
-    if ([ "$WEBCAM_ENABLED" = "yes" ] && [ -f "$photo" ] && [ -s "$photo" ]) || ([ "$SCREENSHOT_ENABLED" = "yes" ] && [ -f "$screenshot" ] && [ -s "$screenshot" ]); then
-        echo "," >> "$temp_json"
-        echo "  \"attachments\": [" >> "$temp_json"
-        
-        local attachment_count=0
-        
-        if [ "$WEBCAM_ENABLED" = "yes" ] && [ -f "$photo" ] && [ -s "$photo" ]; then
-            local photo_data
-            photo_data=$(base64 < "$photo" | tr -d '\n')
-            echo "    {" >> "$temp_json"
-            echo "      \"filename\": \"webcam.jpg\"," >> "$temp_json"
-            echo "      \"content\": \"${photo_data}\"" >> "$temp_json"
-            echo "    }" >> "$temp_json"
-            attachment_count=$((attachment_count + 1))
-        fi
-        
-        if [ "$SCREENSHOT_ENABLED" = "yes" ] && [ -f "$screenshot" ] && [ -s "$screenshot" ]; then
-            if [ $attachment_count -gt 0 ]; then
-                echo "    ," >> "$temp_json"
-            fi
-            local screenshot_data
-            screenshot_data=$(base64 < "$screenshot" | tr -d '\n')
-            echo "    {" >> "$temp_json"
-            echo "      \"filename\": \"screen.jpg\"," >> "$temp_json"
-            echo "      \"content\": \"${screenshot_data}\"" >> "$temp_json"
-            echo "    }" >> "$temp_json"
-        fi
-        
-        echo "  ]" >> "$temp_json"
-    fi
-    
-    echo "}" >> "$temp_json"
-    
-    # Save JSON for debugging
-    save_json_debug "$temp_json" "$TARGET_DIR/debug_initial_email.json"
+    build_email_payload "$temp_json" "${email_subject}" "$body_kind" "$body_content" \
+        "webcam.jpg=$([ "$WEBCAM_ENABLED" = "yes" ] && echo "$photo")" \
+        "screen.jpg=$([ "$SCREENSHOT_ENABLED" = "yes" ] && echo "$screenshot")" || {
+        echo "Failed to build initial email payload"
+        rm -f "$temp_json"
+        return 1
+    }
 
     echo "Sending initial email"
     local response
-    response=$(curl -s -w "%{http_code}" -X POST \
-       -H "Authorization: Bearer ${RESEND_API_KEY}" \
-       -H "Content-Type: application/json" \
-       --data-binary "@$temp_json" \
-       "https://api.resend.com/emails")
+    response=$(send_email_payload "$temp_json")
     rm -f "$temp_json"
 
     local http_code=${response: -3}
@@ -2212,15 +2197,7 @@ send_followup_email() {
         # Generate HTML email content
         local email_html=$(generate_html_followup_email "$CURRENT_USER" "$SCREENSHOT_LOCAL_CAPTURE")
         
-        # Create JSON with HTML content
-        cat > "$temp_json" << EOF
-{
-  "from": "Mac Watcher <${EMAIL_FROM}>",
-  "to": "${EMAIL_TO}",
-  "subject": "Re: ${original_subject}",
-  "reply_to": "${EMAIL_FROM}",
-  "html": $(printf '%s' "$email_html" | jq -Rs .)
-EOF
+        local body_kind="html" body_content="$email_html"
     else
         # Get location information for plain text
         local location_info="Location tracking Disabled"
@@ -2266,48 +2243,19 @@ Local IP Address: Disabled
 Public IP Address: Disabled"
         fi
         
-        # Create email JSON with proper escaping
-        local escaped_body=$(echo "$email_body" | sed 's/"/\\"/g' | sed 's/$/\\n/g' | tr -d '\n')
-        
-        # Create base JSON structure
-        cat > "$temp_json" << EOF
-{
-  "from": "Mac Watcher <${EMAIL_FROM}>",
-  "to": "${EMAIL_TO}",
-  "subject": "Re: ${original_subject}",
-  "reply_to": "${EMAIL_FROM}",
-  "text": "${escaped_body}"
-EOF
+        local body_kind="text" body_content="$email_body"
     fi
     
-    # Only add screenshot if available and enabled in config
-    if [ "$SCREENSHOT_ENABLED" = "yes" ] && [ -f "$screenshot" ] && [ -s "$screenshot" ]; then
-        local screenshot_data
-        screenshot_data=$(base64 < "$screenshot" | tr -d '\n')
-        echo "," >> "$temp_json"
-        cat >> "$temp_json" << EOF
-  "attachments": [
-    {
-      "filename": "follow_up_screen.jpg",
-      "content": "${screenshot_data}"
+    build_email_payload "$temp_json" "Re: ${original_subject}" "$body_kind" "$body_content" \
+        "follow_up_screen.jpg=$([ "$SCREENSHOT_ENABLED" = "yes" ] && echo "$screenshot")" || {
+        echo "Failed to build follow-up email payload"
+        rm -f "$temp_json"
+        return 1
     }
-  ]
-EOF
-    fi
-    
-    # Close the JSON object
-    echo "}" >> "$temp_json"
-    
-    # Save JSON for debugging
-    save_json_debug "$temp_json" "$TARGET_DIR/debug_followup_email.json"
 
-    echo "Sending follow-up email to ${EMAIL_TO} from ${EMAIL_FROM}..."
+    echo "Sending follow-up email"
     local response
-    response=$(curl -s -w "%{http_code}" -X POST \
-       -H "Authorization: Bearer ${RESEND_API_KEY}" \
-       -H "Content-Type: application/json" \
-       --data-binary "@$temp_json" \
-       "https://api.resend.com/emails")
+    response=$(send_email_payload "$temp_json")
     rm -f "$temp_json"
 
     local http_code=${response: -3}

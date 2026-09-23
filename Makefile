@@ -50,4 +50,5 @@ test:
 	bash -n share/mac-watcher/config.sh
 	bash -n share/mac-watcher/monitor.sh
 	bash -n share/mac-watcher/setup.sh
+	/bin/bash tests/test_security.sh
 	@echo "Tests passed." 

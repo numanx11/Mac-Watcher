@@ -213,4 +213,21 @@ This project is licensed under the MIT License
 
 ## Security & Privacy
 
-Mac-Watcher is designed with privacy in mind. All data is stored locally on your machine and is only shared via email if you explicitly configure it to do so. 
+Mac-Watcher is designed with privacy in mind. All data is stored locally on your machine and is only shared via email if you explicitly configure it to do so.
+
+- `~/.config/monitor.conf` holds your Resend API key and is kept private (`0600`); existing
+  installs are tightened automatically on the next run. Config values are escaped when saved,
+  so they can never run code when the file is loaded.
+- Captured photos, screenshots, location data and logs are created private to your user.
+- The API key is passed to `curl` on stdin, so it does not show up in the process list, and it
+  is masked in the configuration menu.
+- Values from the network (Wi-Fi name, public IP, reverse geocoding) are HTML-escaped in the
+  alert email, the public IP is fetched over HTTPS and validated, and the email payload is built
+  with `jq`, so none of them can alter the email or add recipients.
+- Auto-delete only runs when `BASE_DIR` is an absolute path to a directory inside your home
+  folder (never the home folder itself), and it only removes the dated capture folders
+  (`BASE_DIR/YYYY/...`) that Mac-Watcher creates.
+- The email payload is no longer kept on disk after sending. Set `DEBUG_EMAIL_JSON="yes"` in
+  `~/.config/monitor.conf` to keep `debug_initial_email.json` / `debug_followup_email.json`
+  for troubleshooting (they contain the attachments).
+

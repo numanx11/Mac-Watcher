@@ -145,7 +145,7 @@ display_summary() {
     fi
     
     if [ -n "$RESEND_API_KEY" ]; then
-        echo -e "  Resend API Key  : ${SUCCESS}$RESEND_API_KEY${NC}"
+        echo -e "  Resend API Key  : ${SUCCESS}$(mask_secret "$RESEND_API_KEY")${NC}"
     else
         echo -e "  Resend API Key  : ${ERROR}Not configured${NC}"
     fi
@@ -318,7 +318,7 @@ configure_email() {
         fi
         
         if [ -n "$RESEND_API_KEY" ]; then
-            echo -e "  ${PRIMARY}[4]${NC} Resend API Key  : ${SUCCESS}$RESEND_API_KEY${NC}"
+            echo -e "  ${PRIMARY}[4]${NC} Resend API Key  : ${SUCCESS}$(mask_secret "$RESEND_API_KEY")${NC}"
         else
             echo -e "  ${PRIMARY}[4]${NC} Resend API Key  : ${ERROR}Not configured${NC}"
         fi
@@ -1798,44 +1798,65 @@ configure_auto_delete() {
     done
 }
 
+# Quote a value for a double-quoted assignment in the sourced config file, so a
+# value can never run code when the file is sourced
+config_quote() {
+    local v="${1//$'\n'/ }"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    v="${v//\$/\\\$}"
+    v="${v//\`/\\\`}"
+    printf '"%s"' "$v"
+}
+
+# Show only the start and end of the API key
+mask_secret() {
+    local v="$1"
+    if [ ${#v} -le 10 ]; then
+        printf '%s' "****"
+    else
+        printf '%s' "${v:0:5}…${v: -4}"
+    fi
+}
+
 save_configuration() {
     # Get current date/time in UTC
     local current_date_utc=$(date -u "+%Y-%m-%d %H:%M:%S")
-    
-    # Use the current date and user information in the configuration file header
-    cat > "$CONFIG_FILE" << EOL
-# Monitor Configuration
-# Last updated: ${current_date_utc} UTC
-# Updated by: ${CURRENT_USER}
+    local tmp_file="$CONFIG_FILE.tmp.$$"
+    local var
 
-EMAIL_FROM="$EMAIL_FROM"
-EMAIL_TO="$EMAIL_TO"
-RESEND_API_KEY="$RESEND_API_KEY"
-EMAIL_ENABLED="$EMAIL_ENABLED"
-INITIAL_EMAIL_ENABLED="$INITIAL_EMAIL_ENABLED"
-FOLLOWUP_EMAIL_ENABLED="$FOLLOWUP_EMAIL_ENABLED"
-EMAIL_TIME_RESTRICTION_ENABLED="$EMAIL_TIME_RESTRICTION_ENABLED"
-EMAIL_ACTIVE_WINDOWS="$EMAIL_ACTIVE_WINDOWS"
-EMAIL_DAY_RESTRICTION_ENABLED="$EMAIL_DAY_RESTRICTION_ENABLED"
-EMAIL_ACTIVE_DAYS="$EMAIL_ACTIVE_DAYS"
-INITIAL_DELAY=$INITIAL_DELAY
-FOLLOWUP_DELAY=$FOLLOWUP_DELAY
-BASE_DIR="$BASE_DIR"
-LOGIN_FAILURE_DETECTION_ENABLED="$LOGIN_FAILURE_DETECTION_ENABLED"
-LOCATION_ENABLED="$LOCATION_ENABLED"
-LOCATION_METHOD="$LOCATION_METHOD"
-LOCATION_CONFIGURED="$LOCATION_CONFIGURED"
-NETWORK_INFO_ENABLED="$NETWORK_INFO_ENABLED"
-NETWORK_CONFIGURED="$NETWORK_CONFIGURED"
-WEBCAM_ENABLED="$WEBCAM_ENABLED"
-SCREENSHOT_ENABLED="$SCREENSHOT_ENABLED"
-FOLLOWUP_SCREENSHOT_ENABLED="$FOLLOWUP_SCREENSHOT_ENABLED"
-CUSTOM_SCHEDULE_ENABLED="$CUSTOM_SCHEDULE_ENABLED"
-ACTIVE_DAYS="$ACTIVE_DAYS"
-SCHEDULE_ACTIVE_WINDOWS="$SCHEDULE_ACTIVE_WINDOWS"
-AUTO_DELETE_ENABLED="$AUTO_DELETE_ENABLED"
-AUTO_DELETE_DAYS=$AUTO_DELETE_DAYS
-EOL
+    # The file holds the Resend API key: write it private (0600) and replace atomically
+    (
+        umask 077
+        {
+            echo "# Monitor Configuration"
+            echo "# Last updated: ${current_date_utc} UTC"
+            echo "# Updated by: ${CURRENT_USER}"
+            echo
+            for var in EMAIL_FROM EMAIL_TO RESEND_API_KEY EMAIL_ENABLED INITIAL_EMAIL_ENABLED \
+                FOLLOWUP_EMAIL_ENABLED EMAIL_TIME_RESTRICTION_ENABLED EMAIL_ACTIVE_WINDOWS \
+                EMAIL_DAY_RESTRICTION_ENABLED EMAIL_ACTIVE_DAYS INITIAL_DELAY FOLLOWUP_DELAY \
+                BASE_DIR LOGIN_FAILURE_DETECTION_ENABLED LOCATION_ENABLED LOCATION_METHOD \
+                LOCATION_CONFIGURED NETWORK_INFO_ENABLED NETWORK_CONFIGURED WEBCAM_ENABLED \
+                SCREENSHOT_ENABLED FOLLOWUP_SCREENSHOT_ENABLED CUSTOM_SCHEDULE_ENABLED \
+                ACTIVE_DAYS SCHEDULE_ACTIVE_WINDOWS AUTO_DELETE_ENABLED AUTO_DELETE_DAYS; do
+                case "$var" in
+                    INITIAL_DELAY|FOLLOWUP_DELAY|AUTO_DELETE_DAYS)
+                        if [[ "${!var}" =~ ^[0-9]+$ ]]; then
+                            printf '%s=%s\n' "$var" "${!var}"
+                        else
+                            printf '%s=0\n' "$var"
+                        fi ;;
+                    *)
+                        printf '%s=%s\n' "$var" "$(config_quote "${!var}")" ;;
+                esac
+            done
+        } > "$tmp_file"
+    ) && chmod 600 "$tmp_file" && mv -f "$tmp_file" "$CONFIG_FILE" || {
+        rm -f "$tmp_file"
+        echo -e "${ERROR}Failed to save configuration to $CONFIG_FILE${NC}"
+        return 1
+    }
     echo -e "${SUCCESS}Saving configuration to $CONFIG_FILE${NC}"
 }
 
@@ -2078,23 +2099,19 @@ EOF
     # Read the HTML content
     local html_content=$(cat "$temp_html")
     
-    # Create email JSON payload
-    cat > "$temp_json" << EOF
-{
-  "from": "Mac Watcher <${EMAIL_FROM}>",
-  "to": "${EMAIL_TO}",
-  "subject": "Mac-Watcher Test Email",
-  "reply_to": "${EMAIL_FROM}",
-  "html": $(echo "$html_content" | jq -Rs .)
-}
-
-EOF
+    # Create email JSON payload (all fields encoded by jq)
+    jq -n \
+        --arg from "Mac Watcher <${EMAIL_FROM}>" \
+        --arg to "$EMAIL_TO" \
+        --arg html "$html_content" \
+        '{from: $from, to: $to, subject: "Mac-Watcher Test Email", reply_to: $from, html: $html}' > "$temp_json"
     
     # Send the email
     echo -e "${WARNING}Sending test email...${NC}"
     local response
-    response=$(curl -s -w "%{http_code}" -X POST \
-      -H "Authorization: Bearer ${RESEND_API_KEY}" \
+    # API key goes to curl on stdin, never on the command line
+    response=$(printf 'header = "Authorization: Bearer %s"\n' "$RESEND_API_KEY" | curl -s -w "%{http_code}" -X POST \
+      --config - \
       -H "Content-Type: application/json" \
       --data-binary "@$temp_json" \
       "https://api.resend.com/emails")

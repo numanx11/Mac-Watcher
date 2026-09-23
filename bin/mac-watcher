@@ -340,7 +340,7 @@ case "$1" in
         
         # Extract BASE_DIR from config
         source "$CONFIG_FILE"
-        SAVE_DIR=$(eval echo "$BASE_DIR")
+        SAVE_DIR="${BASE_DIR/#\~/$HOME}"
         
         echo -e "${PRIMARY}To view the captured data, check:${NC} ${SUCCESS}$SAVE_DIR${NC}"
         ;;
