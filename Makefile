@@ -1,7 +1,7 @@
 # Makefile for mac-watcher
 
 PREFIX ?= /usr/local
-VERSION = 1.0.7
+VERSION = 1.1.0
 
 .PHONY: all install uninstall package clean test update-formula
 
@@ -22,6 +22,7 @@ install:
 	install -m 755 share/mac-watcher/config.sh $(PREFIX)/share/mac-watcher/config.sh
 	install -m 755 share/mac-watcher/monitor.sh $(PREFIX)/share/mac-watcher/monitor.sh
 	install -m 755 share/mac-watcher/setup.sh $(PREFIX)/share/mac-watcher/setup.sh
+	install -m 755 share/mac-watcher/failwatch.sh $(PREFIX)/share/mac-watcher/failwatch.sh
 	@echo "Installation complete. Run 'mac-watcher --help' for usage."
 
 uninstall:
@@ -50,4 +51,5 @@ test:
 	bash -n share/mac-watcher/config.sh
 	bash -n share/mac-watcher/monitor.sh
 	bash -n share/mac-watcher/setup.sh
+	bash -n share/mac-watcher/failwatch.sh
 	@echo "Tests passed." 

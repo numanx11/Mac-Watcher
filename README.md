@@ -64,6 +64,7 @@ mac-watcher --dependencies    # Check and install dependencies
 mac-watcher --setup           # Set up .wakeup file and default configuration
 mac-watcher --config          # Customize configuration
 mac-watcher --test            # Run the monitor script manually for testing
+mac-watcher --failwatch       # Manage the failed-login watcher (install|uninstall|status)
 mac-watcher --diagnostics     # Check current setup
 mac-watcher --instructions    # Show detailed instructions
 mac-watcher --version         # Display version information
@@ -104,6 +105,33 @@ Mac-Watcher can be configured to only trigger alerts when a login failure is det
 - Provides detailed logs of authentication events
 
 This feature can be enabled/disabled via the configuration utility.
+
+##### Failed-login watcher (recommended on macOS 26+)
+
+The wake hook only runs when sleepwatcher reports a wake from sleep. A Mac on
+AC power often just locks the screen or sleeps the display, and a DarkWake
+followed by a full wake may not trigger it at all, so failed attempts at the
+lock screen can go unnoticed. The failed-login watcher is a LaunchAgent that
+follows loginwindow's log continuously and triggers the capture and email on
+every wrong password or wrong fingerprint:
+
+```bash
+mac-watcher --failwatch install     # install and start the LaunchAgent
+mac-watcher --failwatch status      # state and recent activity
+mac-watcher --failwatch uninstall   # remove it
+```
+
+- At most one capture per 60 seconds for a burst of attempts
+  (`MAC_WATCHER_FAILWATCH_COOLDOWN` overrides it).
+- While it runs, wake-triggered login detection exits early, so there are no duplicate alerts.
+- Activity log: `~/Library/Logs/mac-watcher/failwatch.log`.
+- Because it runs from launchd instead of Terminal, macOS asks for permissions again: allow
+  **Camera** for `imagesnap` and **Screen & System Audio Recording** for `/bin/bash`
+  in System Settings > Privacy & Security.
+
+macOS 26+/27 no longer logs `Failed to authenticate user` for a wrong password; the
+lock screen now logs `authFailWithMessage:numFailedAttempts:] | enter. INCORRECT password`.
+Both markers are recognised.
 
 #### Email Configuration Options
 

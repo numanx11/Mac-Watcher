@@ -40,6 +40,14 @@ fi
 : ${INITIAL_DELAY:=0}
 : ${FOLLOWUP_DELAY:=25}
 : ${LOGIN_FAILURE_DETECTION_ENABLED:="no"}
+
+# Set by failwatch.sh, which has already observed the failed unlock attempt:
+# skip the wait-for-login-event phase and capture immediately.
+if [ -n "$MAC_WATCHER_TRIGGER" ]; then
+    echo "Triggered by failwatch: failed login ($MAC_WATCHER_TRIGGER)"
+    LOGIN_FAILURE_DETECTION_ENABLED="no"
+    INITIAL_DELAY=0
+fi
 : ${LOCATION_METHOD:="corelocation_cli"} 
 : ${NETWORK_INFO_ENABLED:="yes"} 
 : ${WEBCAM_ENABLED:="yes"}
@@ -2359,6 +2367,13 @@ fi
 # Login Detection
 #############################
 if [ "$LOGIN_FAILURE_DETECTION_ENABLED" = "yes" ]; then
+    # When the failwatch LaunchAgent is running it already reports every failed
+    # attempt; a wake-triggered run would only produce duplicate alerts.
+    if launchctl print "gui/$(id -u)/com.mac-watcher.failwatch" &>/dev/null; then
+        echo "Failwatch service is active and handles login failures. Exiting."
+        exit 0
+    fi
+
     echo "Login detection enabled. Monitoring for login attempts..."
     
     # Flag to track detection status
@@ -2393,11 +2408,16 @@ if [ "$LOGIN_FAILURE_DETECTION_ENABLED" = "yes" ]; then
     fi
     
     # Use process substitution to monitor log stream
+    # "Failed to authenticate user" is no longer logged on macOS 26+/27; a wrong
+    # password (and a wrong fingerprint) now logs
+    # "-[LWDefaultScreenLockUI authFailWithMessage:numFailedAttempts:] | enter. INCORRECT password".
     exec 3< <(log stream --predicate '
-      eventMessage CONTAINS "Screen saver unlocked by" OR 
-      eventMessage CONTAINS "setting session authenticated flag" OR
-      eventMessage CONTAINS "Failed to authenticate user" OR 
-      eventMessage CONTAINS "APEventTouchIDNoMatch" OR
+      (process == "loginwindow" AND (
+        eventMessage CONTAINS "Screen saver unlocked by" OR
+        eventMessage CONTAINS "setting session authenticated flag" OR
+        eventMessage CONTAINS "Failed to authenticate user" OR
+        eventMessage CONTAINS "INCORRECT password" OR
+        eventMessage CONTAINS "APEventTouchIDNoMatch")) OR
       eventMessage CONTAINS "System is sleeping"
     ' --style syslog 2>/dev/null)
     
@@ -2449,7 +2469,7 @@ if [ "$LOGIN_FAILURE_DETECTION_ENABLED" = "yes" ]; then
             break
         
         # FAILURE DETECTION - Password
-        elif [[ "$line" == *"Failed to authenticate user"* ]]; then
+        elif [[ "$line" == *"Failed to authenticate user"* || "$line" == *"INCORRECT password"* ]]; then
             auth_method="password"
             echo "[$log_timestamp] ❌ FAILED: Login using $auth_method failed"
             login_detected=true

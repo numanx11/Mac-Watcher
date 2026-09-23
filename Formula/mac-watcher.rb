@@ -16,9 +16,11 @@ class MacWatcher < Formula
     pkgshare.install "share/mac-watcher/config.sh"
     pkgshare.install "share/mac-watcher/monitor.sh"
     pkgshare.install "share/mac-watcher/setup.sh"
+    pkgshare.install "share/mac-watcher/failwatch.sh"
     chmod 0755, pkgshare/"config.sh"
     chmod 0755, pkgshare/"monitor.sh"
     chmod 0755, pkgshare/"setup.sh"
+    chmod 0755, pkgshare/"failwatch.sh"
   end
 
   def caveats
@@ -30,6 +32,10 @@ class MacWatcher < Formula
 
       Then start the sleepwatcher service:
         brew services start sleepwatcher
+
+      To detect failed logins even when the Mac does not sleep/wake
+      (recommended on macOS 26+):
+        mac-watcher --failwatch install
 
       To test functionality without waiting for a wake event:
         mac-watcher --test
